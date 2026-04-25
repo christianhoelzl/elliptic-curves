@@ -346,16 +346,18 @@ impl pkcs8::EncodePrivateKey for KeypairBytes {
         let public_key = verifying_key
             .map(|k| pkcs8::der::asn1::BitStringRef::from_bytes(k))
             .transpose()?;
-        let private_key = pkcs8::der::asn1::OctetStringRef::new(self.secret_key.as_ref())?;
+        // RFC 8410: privateKey content is a DER OCTET STRING wrapping the seed.
+        let mut private_key_buf = [0u8; 2 + SECRET_KEY_LENGTH];
+        private_key_buf[..2].copy_from_slice(&[0x04, SECRET_KEY_LENGTH as u8]);
+        private_key_buf[2..].copy_from_slice(self.secret_key.as_ref());
+        let private_key = pkcs8::der::asn1::OctetStringRef::new(&private_key_buf)?;
 
         let private_key_info = pkcs8::PrivateKeyInfoRef {
             algorithm: super::ALGORITHM_ID,
             private_key,
             public_key,
         };
-        let result = pkcs8::SecretDocument::encode_msg(&private_key_info)?;
-
-        Ok(result)
+        Ok(pkcs8::SecretDocument::encode_msg(&private_key_info)?)
     }
 }
 
@@ -367,11 +369,12 @@ impl TryFrom<pkcs8::PrivateKeyInfoRef<'_>> for KeypairBytes {
         if value.algorithm.oid != super::ALGORITHM_OID {
             return Err(pkcs8::Error::KeyMalformed);
         }
-        if value.private_key.as_bytes().len() != SECRET_KEY_LENGTH {
-            return Err(pkcs8::Error::KeyMalformed);
-        }
-        let mut secret_key = [0u8; SECRET_KEY_LENGTH];
-        secret_key.copy_from_slice(value.private_key.as_bytes());
+
+        let secret_key: [u8; SECRET_KEY_LENGTH] = value.private_key.as_ref()
+            .strip_prefix(&[0x04, SECRET_KEY_LENGTH as u8])
+            .and_then(|s| s.try_into().ok())
+            .ok_or(pkcs8::Error::KeyMalformed)?;
+
         let verifying_key = if let Some(public_key) = value.public_key {
             if public_key.has_unused_bits() {
                 return Err(pkcs8::Error::KeyMalformed);
@@ -531,16 +534,81 @@ impl SigningKey {
     }
 }
 
-#[cfg(all(feature = "getrandom", feature = "serde"))]
-#[test]
-fn serialization() {
-    let signing_key = SigningKey::generate();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let bytes = serde_bare::to_vec(&signing_key).unwrap();
-    let signing_key2: SigningKey = serde_bare::from_slice(&bytes).unwrap();
-    assert_eq!(signing_key, signing_key2);
+    #[cfg(all(feature = "getrandom", feature = "serde"))]
+    #[test]
+    fn serialization() {
+        let signing_key = SigningKey::generate();
 
-    let string = serde_json::to_string(&signing_key).unwrap();
-    let signing_key3: SigningKey = serde_json::from_str(&string).unwrap();
-    assert_eq!(signing_key, signing_key3);
+        let bytes = serde_bare::to_vec(&signing_key).unwrap();
+        let signing_key2: SigningKey = serde_bare::from_slice(&bytes).unwrap();
+        assert_eq!(signing_key, signing_key2);
+
+        let string = serde_json::to_string(&signing_key).unwrap();
+        let signing_key3: SigningKey = serde_json::from_str(&string).unwrap();
+        assert_eq!(signing_key, signing_key3);
+    }
+
+    #[cfg(feature = "pkcs8")]
+    #[test]
+    fn pkcs8_keypair_round_trip() {
+        use pkcs8::EncodePrivateKey;
+
+        let signing_key = SigningKey::generate();
+        let keypair = KeypairBytes::from(&signing_key);
+        // KeypairBytes::from(&SigningKey) always includes the public key, producing
+        // a OneAsymmetricKey v2 (version INTEGER = 1) document. This exercises the
+        // public key encode/decode path, including the has_unused_bits and length
+        // checks in TryFrom<PrivateKeyInfoRef>.
+        assert!(keypair.verifying_key.is_some());
+
+        let doc = keypair.to_pkcs8_der().expect("encode PKCS#8");
+        let pki = pkcs8::PrivateKeyInfo::try_from(doc.as_bytes()).expect("decode PrivateKeyInfo");
+
+        let keypair2 = KeypairBytes::try_from(pki).expect("KeypairBytes from PrivateKeyInfo");
+        assert_eq!(keypair, keypair2);
+
+        let signing_key2 = SigningKey::try_from(keypair2).expect("SigningKey from KeypairBytes");
+        assert_eq!(signing_key, signing_key2);
+    }
+
+    #[cfg(all(feature = "alloc", feature = "pkcs8"))]
+    #[test]
+    fn pkcs8_with_openssl_generated_key() {
+        use pkcs8::EncodePrivateKey;
+
+        // Ed448 OneAsymmetricKey (RFC 5958 / RFC 8410) v1, no public key.
+        // Generated with OpenSSL 3.4.1: openssl genpkey -algorithm ed448 -outform DER
+        let der = hex_literal::hex!(
+            "3047020100300506032b6571043b0439"
+            "0dcc06f6f2205b107292133fb3b98049"
+            "7eca62f0f61b8b0095b2a0b3f4a9e888"
+            "2dd9e7b8d18eba3cc8b32af2bbeceff5"
+            "f1b1eb8fef3eb1c3d2"
+        );
+        let expected_seed = hex_literal::hex!(
+            "0dcc06f6f2205b107292133fb3b98049"
+            "7eca62f0f61b8b0095b2a0b3f4a9e888"
+            "2dd9e7b8d18eba3cc8b32af2bbeceff5"
+            "f1b1eb8fef3eb1c3d2"
+        );
+
+        // Decode the OpenSSL-generated key and verify the seed.
+        let pki = pkcs8::PrivateKeyInfo::try_from(&der[..]).expect("decode PrivateKeyInfo");
+        let keypair = KeypairBytes::try_from(pki).expect("KeypairBytes from PrivateKeyInfo");
+
+        assert_eq!(keypair.secret_key.as_ref(), &expected_seed[..]);
+        assert!(keypair.verifying_key.is_none());
+
+        // Re-encode and decode again to verify encode/decode symmetry.
+        let doc = keypair.to_pkcs8_der().expect("re-encode PKCS#8");
+        let pki2 = pkcs8::PrivateKeyInfo::try_from(doc.as_bytes()).expect("re-decode PrivateKeyInfo");
+        let keypair2 = KeypairBytes::try_from(pki2).expect("KeypairBytes from re-encoded");
+
+        assert_eq!(keypair, keypair2);
+        assert_eq!(doc.as_bytes(), &der[..]);
+    }
 }
